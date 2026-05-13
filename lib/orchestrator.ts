@@ -10,6 +10,7 @@ export type Song = {
 };
 
 export type ChatMessage = {
+  id: string;
   role: 'user' | 'assistant';
   content: string;
 };
@@ -39,6 +40,21 @@ const DEFAULT_STATE: RadioState = {
   queue: DEFAULT_LIBRARY.slice(1),
   chatHistory: [],
 };
+
+function makeMessage(role: ChatMessage['role'], content: string): ChatMessage {
+  return {
+    id: crypto.randomUUID(),
+    role,
+    content,
+  };
+}
+
+function normalizeState(state: RadioState): RadioState {
+  return {
+    ...state,
+    chatHistory: state.chatHistory.map((item) => (item.id ? item : makeMessage(item.role, item.content))),
+  };
+}
 
 async function ensureDataDir(): Promise<void> {
   await mkdir(DATA_DIR, { recursive: true });
@@ -100,7 +116,7 @@ export async function getPlayableLibrary(): Promise<Song[]> {
 export async function getRadioState(): Promise<RadioState> {
   const existing = await readJsonFile<RadioState>(RADIO_STATE_FILE);
   if (existing) {
-    return existing;
+    return normalizeState(existing);
   }
 
   await writeJsonFile(RADIO_STATE_FILE, DEFAULT_STATE);
@@ -125,7 +141,7 @@ export async function orchestrateUserMessage(message: string): Promise<RadioStat
 
   nextState = {
     ...nextState,
-    chatHistory: [...nextState.chatHistory, { role: 'user', content: message }, { role: 'assistant', content: reply }],
+    chatHistory: [...nextState.chatHistory, makeMessage('user', message), makeMessage('assistant', reply)],
   };
 
   await writeJsonFile(RADIO_STATE_FILE, nextState);

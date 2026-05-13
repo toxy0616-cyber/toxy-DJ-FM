@@ -13,8 +13,8 @@ export function ToxyRadio({ initialState }: { initialState: RadioState }) {
       <section>
         <h2>聊天</h2>
         <ul>
-          {initialState.chatHistory.map((msg, idx) => (
-            <li key={`${msg.role}-${idx}`}>
+          {initialState.chatHistory.map((msg) => (
+            <li key={msg.id}>
               <strong>{msg.role}:</strong> {msg.content}
             </li>
           ))}
