@@ -1,0 +1,16 @@
+.next
+.next*
+node_modules
+coverage
+.data
+.env
+.env.local
+dist
+*.tsbuildinfo
+*.log
+.dotnet-home
+.edge-test-profile
+ToxyLauncher-dist
+launcher/bin
+launcher/obj
+.launcher-server.log
