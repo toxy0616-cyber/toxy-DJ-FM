@@ -46,8 +46,23 @@ export interface TrackIntent {
   mood: string;
   energy: "low" | "medium" | "high";
   palette: string[];
+  keywords: string[];
   avoid: string[];
   rationale: string;
+}
+
+export interface WhySelectedEntry {
+  label: string;
+  scoreDelta: number;
+  detail: string;
+}
+
+export interface WhyRejectedEntry {
+  trackId: string;
+  title: string;
+  artist: string;
+  scoreDelta: number;
+  detail: string;
 }
 
 export interface ChatTurn {
@@ -191,6 +206,8 @@ export interface ChatResponsePayload {
   selectionStatus: TrackSelectionStatus;
   candidateTracks?: TrackCandidate[];
   weatherSummary?: string;
+  why_selected?: WhySelectedEntry[];
+  why_rejected?: WhyRejectedEntry[];
 }
 
 export interface GreetingResponsePayload {
@@ -207,6 +224,8 @@ export interface RadioSelectPayload {
   candidateTracks?: TrackCandidate[];
   assistantTurn?: ChatTurn;
   switchToken?: string | null;
+  why_selected?: WhySelectedEntry[];
+  why_rejected?: WhyRejectedEntry[];
 }
 
 export interface RadioCommentaryPayload {
@@ -216,4 +235,6 @@ export interface RadioCommentaryPayload {
   selectionStatus: TrackSelectionStatus;
   skipped: boolean;
   switchToken?: string | null;
+  why_selected?: WhySelectedEntry[];
+  why_rejected?: WhyRejectedEntry[];
 }

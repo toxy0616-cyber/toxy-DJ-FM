@@ -80,6 +80,7 @@ describe("HybridMusicProvider", () => {
         mood: "defiant",
         energy: "high",
         palette: ["festival", "drops"],
+        keywords: [],
         avoid: tasteProfile.hardNo,
         rationale: "User wants a defiant push."
       },
@@ -98,6 +99,7 @@ describe("HybridMusicProvider", () => {
         mood: "locked-in",
         energy: "medium",
         palette: ["focus"],
+        keywords: [],
         avoid: [],
         rationale: "Need a study track."
       },
@@ -118,5 +120,50 @@ describe("HybridMusicProvider", () => {
     expect(matches[0]?.title).toBe("Reflection Eternal");
     expect(matches[0]?.provider).toBe("qqmusic");
   });
-});
 
+  test("returns structured why_selected and why_rejected reasons", async () => {
+    vi.mocked(readPlayableLibrary).mockResolvedValue(playableLibrary);
+
+    const provider = getMusicProvider();
+    const decision = await provider.selectTrackWithExplanation(
+      {
+        mood: "locked-in",
+        energy: "medium",
+        palette: ["focus"],
+        keywords: [],
+        avoid: [],
+        rationale: "Need a study track."
+      },
+      {
+        ...tasteProfile,
+        hardNo: []
+      }
+    );
+
+    expect(decision.selectedTrack.title).toBe("Reflection Eternal");
+    expect(decision.why_selected.length).toBeGreaterThan(0);
+    expect(decision.why_selected.some((item) => item.label === "mood_match")).toBe(true);
+    expect(decision.why_rejected.length).toBeGreaterThan(0);
+    expect(decision.why_rejected.every((item) => item.scoreDelta <= 0)).toBe(true);
+  });
+
+  test("marks hard-no filtered tracks in why_rejected", async () => {
+    vi.mocked(readPlayableLibrary).mockResolvedValue(playableLibrary);
+
+    const provider = getMusicProvider();
+    const decision = await provider.selectTrackWithExplanation(
+      {
+        mood: "defiant",
+        energy: "high",
+        palette: ["festival", "drops"],
+        keywords: [],
+        avoid: tasteProfile.hardNo,
+        rationale: "User wants a defiant push."
+      },
+      tasteProfile
+    );
+
+    expect(decision.selectedTrack.id).not.toBe("mirror-run");
+    expect(decision.why_rejected.some((item) => item.detail.toLowerCase().includes("hard-no"))).toBe(true);
+  });
+});

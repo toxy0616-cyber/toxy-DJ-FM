@@ -1,4 +1,4 @@
-import type { ChatControlIntent } from "@/lib/types";
+﻿import type { ChatControlIntent } from "@/lib/types";
 
 function chineseNumeralToNumber(value: string) {
   const map: Record<string, number> = {
@@ -12,40 +12,51 @@ function chineseNumeralToNumber(value: string) {
   return map[value] ?? Number(value);
 }
 
+function looksLikeRecommendationQuery(query: string) {
+  return /(?:有点|一点|夜晚|开车|通勤|路上|氛围|心情|情绪|感觉|适合|难过|开心|平静|专注|活力|sad|happy|calm|focused|energetic|driving|night|road|commute|vibe|mood)/i.test(
+    query
+  );
+}
+
 export function parseControlIntent(message: string): ChatControlIntent {
   const trimmed = message.trim();
   const lower = trimmed.toLowerCase();
 
-  if (/(?:下一首|下首|next|skip|切歌|换一首)/i.test(trimmed)) {
+  if (/(?:下一首|next|skip|切歌|换一首)/i.test(trimmed)) {
     return { type: "next" };
   }
 
   const queueMatch = trimmed.match(/第\s*([一二三四五1-5])\s*首/);
-  if (queueMatch) {
+  if (queueMatch?.[1]) {
     return {
       type: "queue_index",
-      queueIndex: chineseNumeralToNumber(queueMatch[1] ?? "0")
+      queueIndex: chineseNumeralToNumber(queueMatch[1])
     };
   }
 
   const ordinalMatch = trimmed.match(/([1-5])\s*(?:号|首)/);
-  if (ordinalMatch && /(?:切|播|放|来)/.test(trimmed)) {
+  if (ordinalMatch && /(?:切到|播放|放|来首|来一首|切歌)/.test(trimmed)) {
     return {
       type: "queue_index",
       queueIndex: Number(ordinalMatch[1])
     };
   }
 
-  const trackQueryMatch = trimmed.match(/(?:播放|放|切到|来首|来一首|听)\s*(.+)$/i);
+  const trackQueryMatch = trimmed.match(/(?:播放|放|切到|来首|来一首)\s*(.+)$/i);
   if (trackQueryMatch?.[1]) {
     return { type: "track_query", query: trackQueryMatch[1].trim() };
   }
 
   const naturalTrackQueryMatch = trimmed.match(
-    /(?:(?:我)?想听|想听听|给我放|帮我放|放给我|来点|来首|来一首|来个|来一曲|整首|切到)\s*(.+)$/i
+    /(?:(?:我想听|想听|给我放|帮我放|给我来点|来点|来一首|一首|切到|切歌)\s*(.+))$/i
   );
   if (naturalTrackQueryMatch?.[1]) {
-    return { type: "track_query", query: naturalTrackQueryMatch[1].trim() };
+    const query = naturalTrackQueryMatch[1].trim();
+    if (looksLikeRecommendationQuery(query)) {
+      return { type: "none" };
+    }
+
+    return { type: "track_query", query };
   }
 
   if (/^(play|listen to)\s+.+$/i.test(lower)) {

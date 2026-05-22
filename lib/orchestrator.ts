@@ -1,10 +1,15 @@
-import { buildRuntimeContext } from "@/lib/context";
+﻿import { buildRuntimeContext } from "@/lib/context";
 import { getLlmProvider, hasLiveLlmConfig } from "@/lib/providers/llm";
+import type { MusicRecommendationContext } from "@/lib/providers/llm";
+import { RAGMusicProvider } from "@/lib/providers/rag-music";
 import { getMusicProvider } from "@/lib/providers/music";
 import { ensureRadioState, pushMood, pushTrackKey, saveRadioState } from "@/lib/radio-state";
 import { readTasteProfile } from "@/lib/taste";
 import { fetchWeatherContext } from "@/lib/weather";
 import { parseControlIntent } from "@/lib/control-intent";
+import { readPlayableLibrary } from "@/lib/music-library";
+import { getVectorStore } from "@/lib/vector-store";
+import { initializeMusicVectorStore } from "@/lib/startup";
 import type {
   ChatControlIntent,
   RadioCommentaryPayload,
@@ -17,9 +22,35 @@ import type {
   TasteProfile,
   TrackCandidate,
   TrackIntent,
-  TrackSelectionStatus
+  TrackSelectionStatus,
+  WhyRejectedEntry,
+  WhySelectedEntry
 } from "@/lib/types";
 import { makeId } from "@/lib/utils";
+
+// Initialize music vector store at module load time (non-blocking)
+void initializeMusicVectorStore();
+
+const LEGACY_MOOD_MAP: Record<string, string> = {
+  rainy: "sad",
+  drained: "sad",
+  "locked-in": "focused",
+  romantic: "happy",
+  defiant: "energetic"
+};
+
+function normalizeMoodLabel(rawMood: string) {
+  const mood = String(rawMood || "").trim().toLowerCase();
+  if (!mood) {
+    return "calm";
+  }
+
+  if (["happy", "sad", "calm", "focused", "energetic"].includes(mood)) {
+    return mood;
+  }
+
+  return LEGACY_MOOD_MAP[mood] ?? "calm";
+}
 
 function createAssistantTurn(text: string, relatedTrackId?: string): ChatTurn {
   return {
@@ -76,6 +107,13 @@ function isLocationIntent(message: string) {
   );
 }
 
+function isRecommendationIntent(message: string) {
+  const normalized = message.trim();
+  return /(?:推荐|推歌|推送|点歌|歌单|来点歌|发(?:几)?首|安利|适合|难过|伤心|低落|治愈|playlist|song\s*list|list\s+of\s+songs|recommend(?:\s+me)?|suggest(?:\s+me)?|play\s+some\s+songs?|songs?\s+(?:for|to)|music\s+(?:for|to)|tracks?\s+(?:for|to)|give\s+me\s+(?:some\s+)?songs?|mood|vibe|sad|happy|calm|focused|energetic)/i.test(
+    normalized
+  );
+}
+
 function buildWeatherReply(message: string, weatherSummary: string, source: "geolocation" | "ip" | "fallback", locationLabel?: string) {
   const askingLocation = isLocationIntent(message);
   const askingWeather = isWeatherIntent(message);
@@ -108,22 +146,29 @@ function trackKey(track: TrackCandidate) {
 }
 
 function intentFromMood(state: RadioState): TrackIntent {
+  const mood = normalizeMoodLabel(state.mood);
   return {
-    mood: state.mood,
+    mood,
     energy: state.nowPlaying.energy,
     palette: state.nowPlaying.tags,
+    keywords: [],
     avoid: [],
     rationale: "Keep the station within the current emotional lane."
   };
 }
 
 function intentFromTrack(track: TrackCandidate, profile: TasteProfile): TrackIntent {
-  const palette = track.tags.length > 0 ? track.tags : profile.moodMappings.find((item) => item.mood === track.mood)?.palette ?? [];
+  const normalizedMood = normalizeMoodLabel(track.mood);
+  const palette =
+    track.tags.length > 0
+      ? track.tags
+      : profile.moodMappings.find((item) => normalizeMoodLabel(item.mood) === normalizedMood)?.palette ?? [];
 
   return {
-    mood: track.mood,
+    mood: normalizedMood,
     energy: track.energy,
     palette,
+    keywords: [],
     avoid: profile.hardNo,
     rationale: `Follow the texture of ${track.title} by ${track.artist}.`
   };
@@ -141,13 +186,13 @@ function isDirectTrackMatch(query: string, track: TrackCandidate) {
 
 function cleanupTrackQuery(query: string) {
   return query
-    .replace(/^(?:一首|1首|首)\s*/i, "")
-    .replace(/^(?:我)?想听\s*/i, "")
+    .replace(/^(?:一首|1首)\s*/i, "")
+    .replace(/^(?:我想听|想听)\s*/i, "")
     .replace(/^(?:给我放|帮我放|放给我|来点|来首|来一首|整首|切到)\s*/i, "")
     .replace(/^(?:来个|来一曲)\s*/i, "")
     .replace(/\s*(?:的歌|的歌曲|的音乐|的曲子)$/i, "")
     .replace(/\s*(?:song|songs|music|track|tracks)$/i, "")
-    .replace(/[。！!？?]+$/g, "")
+    .replace(/[。！？?,，]+$/g, "")
     .trim();
 }
 
@@ -192,18 +237,24 @@ async function resolveControlSelection(
   queue: TrackCandidate[];
   selectionStatus: TrackSelectionStatus;
   candidateTracks?: TrackCandidate[];
+  why_selected?: WhySelectedEntry[];
+  why_rejected?: WhyRejectedEntry[];
 }> {
   const musicProvider = getMusicProvider();
 
   if (controlIntent.type === "next") {
     const intent = intentFromMood(currentState);
-    const selectedTrack = await musicProvider.pickTrack(intent, profile, currentState.nowPlaying, {
+    const decision = await musicProvider.selectTrackWithExplanation(intent, profile, {
+      current: currentState.nowPlaying,
       recentTrackKeys: currentState.recentTrackKeys
     });
-    const queue = await musicProvider.buildQueue(selectedTrack, intent, profile, {
-      recentTrackKeys: [trackKey(selectedTrack), ...(currentState.recentTrackKeys ?? [])]
-    });
-    return { selectedTrack, queue, selectionStatus: "picked" };
+    return {
+      selectedTrack: decision.selectedTrack,
+      queue: decision.queue,
+      selectionStatus: "picked",
+      why_selected: decision.why_selected,
+      why_rejected: decision.why_rejected
+    };
   }
 
   if (controlIntent.type === "queue_index") {
@@ -217,10 +268,18 @@ async function resolveControlSelection(
     }
 
     const intent = intentFromTrack(selectedTrack, profile);
-    const queue = await musicProvider.buildQueue(selectedTrack, intent, profile, {
-      recentTrackKeys: [trackKey(selectedTrack), ...(currentState.recentTrackKeys ?? [])]
+    const decision = await musicProvider.selectTrackWithExplanation(intent, profile, {
+      current: currentState.nowPlaying,
+      recentTrackKeys: [trackKey(selectedTrack), ...(currentState.recentTrackKeys ?? [])],
+      forcedTrack: selectedTrack
     });
-    return { selectedTrack, queue, selectionStatus: "picked" };
+    return {
+      selectedTrack: decision.selectedTrack,
+      queue: decision.queue,
+      selectionStatus: "picked",
+      why_selected: decision.why_selected,
+      why_rejected: decision.why_rejected
+    };
   }
 
   if (controlIntent.type === "track_query") {
@@ -235,12 +294,18 @@ async function resolveControlSelection(
       const topArtistMatch = artistMatches[0];
       if (topArtistMatch) {
         const intent = intentFromTrack(topArtistMatch, profile);
-        const queue = await musicProvider.buildQueue(topArtistMatch, intent, profile);
+        const decision = await musicProvider.selectTrackWithExplanation(intent, profile, {
+          current: currentState.nowPlaying,
+          recentTrackKeys: currentState.recentTrackKeys,
+          forcedTrack: topArtistMatch
+        });
         return {
-          selectedTrack: topArtistMatch,
-          queue,
+          selectedTrack: decision.selectedTrack,
+          queue: decision.queue,
           selectionStatus: "picked",
-          candidateTracks: artistMatches.slice(0, 5)
+          candidateTracks: artistMatches.slice(0, 5),
+          why_selected: decision.why_selected,
+          why_rejected: decision.why_rejected
         };
       }
 
@@ -254,12 +319,18 @@ async function resolveControlSelection(
     const stateMatch = resolveTrackFromCurrentState(controlIntent.query, currentState);
     if (stateMatch) {
       const intent = intentFromTrack(stateMatch.track, profile);
-      const queue = await musicProvider.buildQueue(stateMatch.track, intent, profile);
+      const decision = await musicProvider.selectTrackWithExplanation(intent, profile, {
+        current: currentState.nowPlaying,
+        recentTrackKeys: currentState.recentTrackKeys,
+        forcedTrack: stateMatch.track
+      });
       return {
-        selectedTrack: stateMatch.track,
-        queue,
+        selectedTrack: decision.selectedTrack,
+        queue: decision.queue,
         selectionStatus: "picked",
-        candidateTracks: [stateMatch.track, ...currentState.queue.filter((track) => track.id !== stateMatch.track.id)].slice(0, 5)
+        candidateTracks: [stateMatch.track, ...currentState.queue.filter((track) => track.id !== stateMatch.track.id)].slice(0, 5),
+        why_selected: decision.why_selected,
+        why_rejected: decision.why_rejected
       };
     }
 
@@ -285,10 +356,19 @@ async function resolveControlSelection(
     }
 
     const intent = intentFromTrack(top, profile);
-    const queue = await musicProvider.buildQueue(top, intent, profile, {
-      recentTrackKeys: [trackKey(top), ...(currentState.recentTrackKeys ?? [])]
+    const decision = await musicProvider.selectTrackWithExplanation(intent, profile, {
+      current: currentState.nowPlaying,
+      recentTrackKeys: [trackKey(top), ...(currentState.recentTrackKeys ?? [])],
+      forcedTrack: top
     });
-    return { selectedTrack: top, queue, selectionStatus: "picked", candidateTracks };
+    return {
+      selectedTrack: decision.selectedTrack,
+      queue: decision.queue,
+      selectionStatus: "picked",
+      candidateTracks,
+      why_selected: decision.why_selected,
+      why_rejected: decision.why_rejected
+    };
   }
 
   return {
@@ -306,14 +386,15 @@ function createUpdatedRadioState(
   reason: string,
   chatHistory: ChatTurn[]
 ): RadioState {
+  const normalizedMood = normalizeMoodLabel(mood);
   return {
     nowPlaying: selectedTrack,
     queue,
-    mood,
+    mood: normalizedMood,
     onAirLine,
     lastReason: reason,
     updatedAt: new Date().toISOString(),
-    recentMoods: pushMood(currentState, mood),
+    recentMoods: pushMood(currentState, normalizedMood),
     recentTrackKeys: pushTrackKey(currentState, selectedTrack),
     chatHistory,
     activeSwitchToken: null
@@ -327,15 +408,16 @@ function createImmediateTrackSwitchState(
   chatHistory = currentState.chatHistory,
   switchToken: string
 ): RadioState {
+  const normalizedMood = normalizeMoodLabel(selectedTrack.mood);
   return {
     ...currentState,
     nowPlaying: selectedTrack,
     queue,
-    mood: selectedTrack.mood,
+    mood: normalizedMood,
     onAirLine: `${selectedTrack.title} is live now. Toxy is catching up in the booth.`,
     lastReason: `Switched immediately to ${selectedTrack.title} by ${selectedTrack.artist}.`,
     updatedAt: new Date().toISOString(),
-    recentMoods: pushMood(currentState, selectedTrack.mood),
+    recentMoods: pushMood(currentState, normalizedMood),
     recentTrackKeys: pushTrackKey(currentState, selectedTrack),
     chatHistory,
     activeSwitchToken: switchToken
@@ -408,7 +490,9 @@ async function executeControlIntent(
     candidates: selection.selectedTrack ? [selection.selectedTrack, ...selection.queue] : currentState.queue,
     controlIntent,
     selectionStatus: selection.selectionStatus,
-    candidateTracks: selection.candidateTracks
+    candidateTracks: selection.candidateTracks,
+    why_selected: selection.why_selected,
+    why_rejected: selection.why_rejected
   };
 }
 
@@ -463,10 +547,15 @@ export async function handleChat(
 ): Promise<ChatResponsePayload> {
   const profile = await readTasteProfile();
   const currentState = await ensureRadioState(profile);
-  const llmProvider = getLlmProvider();
   const runtimeContext = buildRuntimeContext(currentState);
   const controlIntent = parseControlIntent(message);
   const userTurn = createUserTurn(message);
+
+  if (controlIntent.type !== "none") {
+    return executeControlIntent(controlIntent, message, currentState, profile, runtimeContext, {
+      userTurn
+    });
+  }
 
   if (isWeatherIntent(message) || isLocationIntent(message)) {
     const weather = await fetchWeatherContext(options?.latitude, options?.longitude);
@@ -495,10 +584,92 @@ export async function handleChat(
     };
   }
 
-  if (controlIntent.type !== "none") {
-    return executeControlIntent(controlIntent, message, currentState, profile, runtimeContext, {
-      userTurn
-    });
+  const llmProvider = getLlmProvider();
+  if (isRecommendationIntent(message)) {
+    const fallbackRecommendationTracks = [currentState.nowPlaying, ...currentState.queue]
+      .filter((track) => track.playable)
+      .slice(0, 5);
+
+    const buildRecommendationReply = async (recommendationContext: MusicRecommendationContext, fallbackReasonDetail: string) => {
+      const recommendationLlm = await llmProvider.generate({
+        profile,
+        radioState: currentState,
+        runtimeContext,
+        userMessage: message,
+        resolvedControlIntent: controlIntent,
+        recommendationContext
+      });
+      const assistantTurn = createAssistantTurn(recommendationLlm.reply, currentState.nowPlaying.id);
+      const radioState = {
+        ...currentState,
+        updatedAt: new Date().toISOString(),
+        chatHistory: trimHistory([...currentState.chatHistory, userTurn, assistantTurn])
+      };
+
+      await saveRadioState(radioState);
+
+      return {
+        assistantTurn,
+        mood: radioState.mood,
+        reason: recommendationLlm.reason || fallbackReasonDetail,
+        radioState,
+        candidates: [radioState.nowPlaying, ...radioState.queue],
+        controlIntent: { type: "none" } as const,
+        selectionStatus: "candidate_required" as const,
+        candidateTracks: recommendationContext.selectedTracks.slice(0, 5),
+        why_selected: recommendationContext.explanations.slice(0, 5)
+      };
+    };
+
+    try {
+      const vectorStore = getVectorStore();
+      await vectorStore.load();
+
+      if ((await vectorStore.count()) > 0) {
+        const library = await readPlayableLibrary();
+        if (library) {
+          const ragProvider = new RAGMusicProvider(library);
+          const ragResult = await ragProvider.selectTrackWithExplanation(message, profile, currentState.recentTrackKeys ?? [], 5);
+
+          if (ragResult.selectedTracks.length > 0) {
+            const recommendationContext: MusicRecommendationContext = {
+              query: message,
+              selectedTracks: ragResult.selectedTracks.slice(0, 5),
+              candidateTracks: ragResult.candidateTracks.slice(0, 10),
+              explanations: ragResult.explanations.slice(0, 5),
+              limit: 5
+            };
+
+            return buildRecommendationReply(
+              recommendationContext,
+              "Built a recommendation set from local RAG matches."
+            );
+          }
+        }
+      }
+    } catch (error) {
+      console.warn("Recommendation mode fallback:", error);
+    }
+
+    if (fallbackRecommendationTracks.length > 0) {
+      const fallbackExplanations: WhySelectedEntry[] = fallbackRecommendationTracks.map((track, index) => ({
+        label: "recommendation_fallback",
+        scoreDelta: 0.2,
+        detail: `Fallback pick #${index + 1}: ${track.title} by ${track.artist}`
+      }));
+      const fallbackContext: MusicRecommendationContext = {
+        query: message,
+        selectedTracks: fallbackRecommendationTracks,
+        candidateTracks: fallbackRecommendationTracks,
+        explanations: fallbackExplanations,
+        limit: fallbackRecommendationTracks.length
+      };
+
+      return buildRecommendationReply(
+        fallbackContext,
+        "Recommendation engine fallback used station queue because local RAG was unavailable."
+      );
+    }
   }
 
   const llm = await llmProvider.generate({
@@ -575,7 +746,9 @@ export async function selectTrackImmediateAction(
       selectionStatus: selection.selectionStatus,
       candidateTracks: selection.candidateTracks,
       assistantTurn,
-      switchToken: null
+      switchToken: null,
+      why_selected: selection.why_selected,
+      why_rejected: selection.why_rejected
     };
   }
 
@@ -589,7 +762,9 @@ export async function selectTrackImmediateAction(
     controlIntent: action,
     selectionStatus: selection.selectionStatus,
     candidateTracks: selection.candidateTracks,
-    switchToken
+    switchToken,
+    why_selected: selection.why_selected,
+    why_rejected: selection.why_rejected
   };
 }
 
@@ -641,7 +816,7 @@ export async function createTrackCommentaryAction(
   }
 
   const assistantTurn = createAssistantTurn(llm.reply, latestState.nowPlaying.id);
-  const mood = llm.mood || latestState.nowPlaying.mood;
+  const mood = normalizeMoodLabel(llm.mood || latestState.nowPlaying.mood);
   const radioState = {
     ...latestState,
     mood,
@@ -671,17 +846,17 @@ export async function getDailyPlaylist(): Promise<DailyPlaylistEntry[]> {
   const entries = [
     {
       slot: "Morning Reset",
-      mood: "drained",
+      mood: "sad",
       summary: "Ease into the day with soft edges and breathing room."
     },
     {
       slot: "Focus Window",
-      mood: "locked-in",
+      mood: "focused",
       summary: "Keep the pulse steady and clear enough for work."
     },
     {
       slot: "Night Drift",
-      mood: "rainy",
+      mood: "calm",
       summary: "Lean into the dim, reflective side of the station."
     }
   ] as const;
@@ -693,8 +868,9 @@ export async function getDailyPlaylist(): Promise<DailyPlaylistEntry[]> {
     const track = await musicProvider.pickTrack(
       {
         mood: entry.mood,
-        energy: entry.mood === "locked-in" ? "medium" : "low",
+        energy: entry.mood === "focused" ? "medium" : "low",
         palette,
+        keywords: [],
         avoid: profile.hardNo,
         rationale: entry.summary
       },
@@ -709,3 +885,4 @@ export async function getDailyPlaylist(): Promise<DailyPlaylistEntry[]> {
 
   return playlist;
 }
+

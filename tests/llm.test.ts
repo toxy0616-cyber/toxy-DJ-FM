@@ -1,6 +1,14 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
-import { buildFallbackResponse, buildLlmTasteContext, hasLiveLlmConfig, resolveDeepSeekConfigFromEnv } from "@/lib/providers/llm";
+import {
+  buildFallbackResponse,
+  buildLlmTasteContext,
+  buildRetrievedLocalContext,
+  hasLiveLlmConfig,
+  rankLocalRagSnippets,
+  localJsonFileIO,
+  resolveDeepSeekConfigFromEnv
+} from "@/lib/providers/llm";
 import type { RadioState, TasteProfile } from "@/lib/types";
 
 const profile: TasteProfile = {
@@ -63,7 +71,7 @@ describe("buildFallbackResponse", () => {
       userMessage: "I need to focus and keep coding for another hour."
     });
 
-    expect(response.mood).toBe("locked-in");
+    expect(response.mood).toBe("focused");
     expect(response.trackIntent.energy).toBe("medium");
     expect(response.reply).toContain("02:12");
   });
@@ -104,7 +112,7 @@ describe("resolveDeepSeekConfigFromEnv", () => {
     });
 
     expect(config.baseUrl).toBe("https://api.deepseek.com");
-    expect(config.model).toBe("deepseek-v4-flash");
+    expect(config.model).toBe("deepseek-chat");
   });
 
   test("keeps explicit overrides", () => {
@@ -131,5 +139,159 @@ describe("buildLlmTasteContext", () => {
     expect(context).toContain("Genres: Jazz Hip-Hop(0.95)");
     expect(context).toContain("Full taste file:");
     expect(context).toContain("# Toxy Taste File");
+  });
+});
+
+describe("lightweight local rag", () => {
+  test("retrieves top-k snippets from taste source, chat history, and recent plays", async () => {
+    const result = await buildRetrievedLocalContext(
+      {
+        userMessage: "play rain or history and keep the mood soft",
+        radioState: {
+          ...radioState,
+          chatHistory: [
+            {
+              id: "chat-1",
+              role: "user",
+              text: "please play rain",
+              createdAt: "2026-05-12T01:00:00.000Z"
+            },
+            {
+              id: "chat-2",
+              role: "assistant",
+              text: "I can queue History for you",
+              createdAt: "2026-05-12T01:00:05.000Z"
+            }
+          ],
+          recentTrackKeys: ["local:shining-rain", "local:history-rich-brian"]
+        }
+      },
+      {
+        tasteSourceSnapshot: {
+          platform: "local",
+          importedAt: "2026-05-11T07:46:31.587Z",
+          recordCount: 590,
+          likedCount: 0,
+          skippedCount: 0,
+          topTracks: ["History - 88rising _ Rich Brian"],
+          topArtists: ["Imagine Dragons"],
+          topGenres: [],
+          topTags: ["soft"],
+          moodHints: ["rainy"]
+        },
+        playableLibrarySnapshot: {
+          provider: "local",
+          importedAt: "2026-05-11T07:46:31.563Z",
+          tracks: [
+            {
+              provider: "local",
+              providerTrackId: "shining-rain",
+              title: "Rain",
+              artist: "Shining",
+              album: "music",
+              energy: "low",
+              mood: "rainy",
+              tags: ["soft"],
+              searchableText: "rain shining",
+              importedAt: "2026-05-11T07:46:31.563Z",
+              playable: true
+            },
+            {
+              provider: "local",
+              providerTrackId: "history-rich-brian",
+              title: "History",
+              artist: "88rising _ Rich Brian",
+              album: "music",
+              energy: "low",
+              mood: "drained",
+              tags: [],
+              searchableText: "history rich brian",
+              importedAt: "2026-05-11T07:46:31.563Z",
+              playable: true
+            }
+          ]
+        }
+      }
+    );
+
+    expect(result.snippets.length).toBeLessThanOrEqual(6);
+    expect(result.promptBlock).toContain("[chat-history]");
+    expect(result.promptBlock).toContain("[recent-plays]");
+    expect(result.promptBlock).toContain("[taste-source]");
+  });
+
+  test("prioritizes lexical matches and prefers newer snippets on tie", () => {
+    const ranked = rankLocalRagSnippets("rain shining", [
+      { source: "chat-history", text: "user: random topic unrelated", recencyIndex: 0 },
+      { source: "recent-plays", text: "Recent play: Rain - Shining", recencyIndex: 4 },
+      { source: "chat-history", text: "user: rain shining please", recencyIndex: 2 }
+    ]);
+
+    expect(ranked[0]?.text).toContain("rain shining");
+    expect(ranked[1]?.text).toContain("Rain - Shining");
+
+    const tieRanked = rankLocalRagSnippets("rain", [
+      { source: "chat-history", text: "user: rain", recencyIndex: 3 },
+      { source: "chat-history", text: "assistant: rain", recencyIndex: 0 }
+    ]);
+
+    expect(tieRanked[0]?.recencyIndex).toBe(0);
+  });
+
+  test("degrades safely when local json is missing or invalid", async () => {
+    const readSpy = vi.spyOn(localJsonFileIO, "readFile").mockImplementation(async (filePath) => {
+      const target = String(filePath);
+      if (target.endsWith("taste-source.json")) {
+        throw new Error("missing file");
+      }
+
+      return "{invalid-json";
+    });
+    try {
+      const result = await buildRetrievedLocalContext({
+        userMessage: "hello dj",
+        radioState: {
+          ...radioState,
+          chatHistory: [],
+          recentTrackKeys: []
+        }
+      });
+
+      expect(result.promptBlock).toBe("none");
+      expect(result.snippets).toHaveLength(0);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  test("caps snippet and total injected length budgets", async () => {
+    const longLine = "rain ".repeat(100);
+    const result = await buildRetrievedLocalContext(
+      {
+        userMessage: "rain",
+        radioState: {
+          ...radioState,
+          chatHistory: [
+            {
+              id: "chat-long",
+              role: "user",
+              text: longLine,
+              createdAt: "2026-05-12T01:00:00.000Z"
+            }
+          ],
+          recentTrackKeys: []
+        }
+      },
+      {
+        maxSnippetChars: 40,
+        maxTotalChars: 60,
+        tasteSourceSnapshot: null,
+        playableLibrarySnapshot: null
+      }
+    );
+
+    expect(result.snippets[0]?.text.length).toBeLessThanOrEqual(40);
+    const totalSnippetChars = result.snippets.reduce((total, snippet) => total + snippet.text.length, 0);
+    expect(totalSnippetChars).toBeLessThanOrEqual(60);
   });
 });

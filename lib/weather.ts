@@ -63,6 +63,7 @@ const WEATHER_LABELS: Record<number, string> = {
   96: "a thunderstorm with hail",
   99: "an intense thunderstorm with hail"
 };
+const WEATHER_FETCH_TIMEOUT_MS = 3500;
 
 function formatTemperature(value: number) {
   return `${Math.round(value)}°C`;
@@ -103,6 +104,31 @@ export function buildWeatherFallbackLine() {
   return "I could not pin down your local weather yet, so I am staying with the mood already hanging in the room.";
 }
 
+async function fetchJsonWithTimeout<T>(url: string | URL) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WEATHER_FETCH_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: "application/json"
+      },
+      cache: "no-store",
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    return (await response.json()) as T;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchOpenMeteoWeather(latitude: number, longitude: number, locationLabel?: string): Promise<WeatherContext | null> {
   const url = new URL("https://api.open-meteo.com/v1/forecast");
   url.searchParams.set("latitude", String(latitude));
@@ -111,85 +137,46 @@ async function fetchOpenMeteoWeather(latitude: number, longitude: number, locati
   url.searchParams.set("timezone", "auto");
   url.searchParams.set("forecast_days", "1");
 
-  try {
-    const response = await fetch(url, {
-      headers: {
-        Accept: "application/json"
-      },
-      cache: "no-store"
-    });
+  const payload = await fetchJsonWithTimeout<OpenMeteoResponse>(url);
+  const current = payload?.current;
 
-    if (!response.ok) {
-      return null;
-    }
-
-    const payload = (await response.json()) as OpenMeteoResponse;
-    const current = payload.current;
-
-    if (!current || typeof current.temperature_2m !== "number") {
-      return null;
-    }
-
-    return {
-      summary: buildWeatherSentence(current.temperature_2m, current.weather_code, current.is_day, locationLabel),
-      source: "geolocation",
-      locationLabel,
-      latitude,
-      longitude
-    };
-  } catch {
+  if (!current || typeof current.temperature_2m !== "number") {
     return null;
   }
+
+  return {
+    summary: buildWeatherSentence(current.temperature_2m, current.weather_code, current.is_day, locationLabel),
+    source: "geolocation",
+    locationLabel,
+    latitude,
+    longitude
+  };
 }
 
 async function lookupIpLocation(): Promise<Pick<WeatherContext, "latitude" | "longitude" | "locationLabel" | "source"> | null> {
-  try {
-    const response = await fetch("https://ipapi.co/json/", {
-      headers: {
-        Accept: "application/json"
-      },
-      cache: "no-store"
-    });
+  const apiPayload = await fetchJsonWithTimeout<IpApiResponse>("https://ipapi.co/json/");
+  if (apiPayload && typeof apiPayload.latitude === "number" && typeof apiPayload.longitude === "number") {
+    return {
+      latitude: apiPayload.latitude,
+      longitude: apiPayload.longitude,
+      locationLabel: compactLocationLabel([apiPayload.city, apiPayload.region, apiPayload.country_name]),
+      source: "ip"
+    };
+  }
 
-    if (response.ok) {
-      const payload = (await response.json()) as IpApiResponse;
-      if (typeof payload.latitude === "number" && typeof payload.longitude === "number") {
-        return {
-          latitude: payload.latitude,
-          longitude: payload.longitude,
-          locationLabel: compactLocationLabel([payload.city, payload.region, payload.country_name]),
-          source: "ip"
-        };
-      }
-    }
-  } catch {}
+  const whoPayload = await fetchJsonWithTimeout<IpWhoResponse>("https://ipwho.is/");
+  if (!whoPayload || whoPayload.success === false) {
+    return null;
+  }
 
-  try {
-    const response = await fetch("https://ipwho.is/", {
-      headers: {
-        Accept: "application/json"
-      },
-      cache: "no-store"
-    });
-
-    if (!response.ok) {
-      return null;
-    }
-
-    const payload = (await response.json()) as IpWhoResponse;
-    if (payload.success === false) {
-      return null;
-    }
-
-    if (typeof payload.latitude === "number" && typeof payload.longitude === "number") {
-      return {
-        latitude: payload.latitude,
-        longitude: payload.longitude,
-        locationLabel: compactLocationLabel([payload.city, payload.region, payload.country]),
-        source: "ip"
-      };
-    }
-  } catch {}
+  if (typeof whoPayload.latitude === "number" && typeof whoPayload.longitude === "number") {
+    return {
+      latitude: whoPayload.latitude,
+      longitude: whoPayload.longitude,
+      locationLabel: compactLocationLabel([whoPayload.city, whoPayload.region, whoPayload.country]),
+      source: "ip"
+    };
+  }
 
   return null;
 }

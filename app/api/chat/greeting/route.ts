@@ -9,17 +9,27 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  const body = (await request.json().catch(() => ({}))) as {
-    reset?: boolean;
-    latitude?: number;
-    longitude?: number;
-  };
+  try {
+    const body = (await request.json().catch(() => ({}))) as {
+      reset?: boolean;
+      latitude?: number;
+      longitude?: number;
+    };
 
-  const payload = await createGreetingAction({
-    reset: body.reset === true,
-    latitude: typeof body.latitude === "number" ? body.latitude : undefined,
-    longitude: typeof body.longitude === "number" ? body.longitude : undefined
-  });
+    const payload = await createGreetingAction({
+      reset: body.reset === true,
+      latitude: typeof body.latitude === "number" ? body.latitude : undefined,
+      longitude: typeof body.longitude === "number" ? body.longitude : undefined
+    });
 
-  return NextResponse.json(payload);
+    return NextResponse.json(payload);
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error: "Greeting generation failed.",
+        details: error instanceof Error ? error.message : String(error)
+      },
+      { status: 500 }
+    );
+  }
 }

@@ -15,12 +15,16 @@ async function ensureDataDir() {
 }
 
 function starterIntent(profile: TasteProfile): TrackIntent {
-  const rainyPalette = profile.moodMappings.find((item) => item.mood === "rainy")?.palette ?? [];
+  const rainyPalette =
+    profile.moodMappings.find((item) => item.mood === "sad")?.palette ??
+    profile.moodMappings.find((item) => item.mood === "rainy")?.palette ??
+    [];
 
   return {
-    mood: "rainy",
+    mood: "sad",
     energy: "low",
     palette: rainyPalette,
+    keywords: ["night", "rain", "calm"],
     avoid: profile.hardNo,
     rationale: "Boot on a calm, rain-lit frequency."
   };
@@ -130,11 +134,11 @@ export async function createInitialRadioState(profile: TasteProfile): Promise<Ra
   return {
     nowPlaying,
     queue,
-    mood: "rainy",
+    mood: "sad",
     onAirLine: "Late-night frequency established.",
     lastReason: "Opening with a softer record to give the station room to breathe.",
     updatedAt: new Date().toISOString(),
-    recentMoods: ["rainy"],
+    recentMoods: ["sad"],
     recentTrackKeys: [trackKey(nowPlaying)],
     chatHistory: starterChat(nowPlaying.id),
     activeSwitchToken: null

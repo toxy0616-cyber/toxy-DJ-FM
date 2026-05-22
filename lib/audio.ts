@@ -1,5 +1,4 @@
 import type { ReadStream } from "node:fs";
-import { Readable } from "node:stream";
 
 const SAMPLE_RATE = 22050;
 const DURATION_SECONDS = 18;
@@ -54,27 +53,90 @@ export function buildWaveBuffer(trackId: string) {
 }
 
 export function createSafeAudioStream(stream: ReadStream, signal?: AbortSignal) {
-  const handleAbort = () => {
+  let closed = false;
+
+  const closeStream = () => {
+    if (closed) {
+      return;
+    }
+
+    closed = true;
     if (!stream.destroyed) {
       stream.destroy();
     }
   };
 
-  if (signal) {
-    if (signal.aborted) {
-      handleAbort();
-    } else {
-      signal.addEventListener("abort", handleAbort, { once: true });
-
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
       const cleanup = () => {
-        signal.removeEventListener("abort", handleAbort);
+        signal?.removeEventListener("abort", onAbort);
+        stream.off("data", onData);
+        stream.off("end", onEnd);
+        stream.off("close", onClose);
+        stream.off("error", onError);
       };
 
-      stream.once("close", cleanup);
-      stream.once("end", cleanup);
-      stream.once("error", cleanup);
-    }
-  }
+      const onData = (chunk: string | Buffer) => {
+        if (closed) {
+          return;
+        }
 
-  return Readable.toWeb(stream) as ReadableStream<Uint8Array>;
+        controller.enqueue(new Uint8Array(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      };
+
+      const onEnd = () => {
+        if (closed) {
+          cleanup();
+          return;
+        }
+
+        closed = true;
+        cleanup();
+        controller.close();
+      };
+
+      const onClose = () => {
+        if (closed) {
+          cleanup();
+          return;
+        }
+
+        closed = true;
+        cleanup();
+        controller.close();
+      };
+
+      const onError = (error: Error) => {
+        if (closed) {
+          cleanup();
+          return;
+        }
+
+        closed = true;
+        cleanup();
+        controller.error(error);
+      };
+
+      const onAbort = () => {
+        cleanup();
+        closeStream();
+      };
+
+      if (signal?.aborted) {
+        cleanup();
+        closeStream();
+        controller.close();
+        return;
+      }
+
+      signal?.addEventListener("abort", onAbort, { once: true });
+      stream.on("data", onData);
+      stream.once("end", onEnd);
+      stream.once("close", onClose);
+      stream.once("error", onError);
+    },
+    cancel() {
+      closeStream();
+    }
+  });
 }

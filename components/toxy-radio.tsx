@@ -24,7 +24,9 @@ import type {
   RadioSelectPayload,
   RadioState,
   TasteProfile,
-  TrackCandidate
+  TrackCandidate,
+  WhyRejectedEntry,
+  WhySelectedEntry
 } from "@/lib/types";
 
 interface ToxyRadioProps {
@@ -71,6 +73,12 @@ type TrackActivationIntent = {
   activationToken: number;
   resetProgress: boolean;
   resumePlayback: boolean;
+};
+
+type TrackDecisionExplanation = {
+  trackId: string;
+  why_selected: WhySelectedEntry[];
+  why_rejected: WhyRejectedEntry[];
 };
 
 const fadeUp: Variants = {
@@ -164,6 +172,54 @@ function buildLocalSystemTurn(text: string): ChatTurn {
   };
 }
 
+async function requestJsonWithTimeout<T>(
+  input: RequestInfo | URL,
+  init: RequestInit & { timeoutMs?: number; retries?: number } = {}
+): Promise<T> {
+  const { timeoutMs = 12000, retries = 0, ...requestInit } = init;
+  let attempt = 0;
+  let lastError: unknown = null;
+
+  while (attempt <= retries) {
+    const controller = new AbortController();
+    const externalSignal = requestInit.signal;
+    const onExternalAbort = () => controller.abort();
+
+    if (externalSignal?.aborted) {
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
+
+    externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(input, {
+        ...requestInit,
+        signal: controller.signal
+      });
+
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({} as { error?: string; details?: string }));
+        const message = detail.error || detail.details || `${response.status} ${response.statusText || "Request failed"}`;
+        throw new Error(message);
+      }
+
+      return (await response.json()) as T;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retries) {
+        break;
+      }
+      attempt += 1;
+    } finally {
+      window.clearTimeout(timer);
+      externalSignal?.removeEventListener("abort", onExternalAbort);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Request failed");
+}
+
 function toRadioSelectRequestBody(action: ChatControlIntent, message?: string) {
   const base: Record<string, unknown> = {
     action: action.type
@@ -182,6 +238,49 @@ function toRadioSelectRequestBody(action: ChatControlIntent, message?: string) {
   }
 
   return base;
+}
+
+function parseRecommendationChoice(rawMessage: string, maxSize: number) {
+  const normalized = rawMessage.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
+  const chineseMatch = normalized.match(/第\s*([一二三四五六七八九1-9])\s*首/);
+  const plainMatch = normalized.match(/(?:^|\s)([1-9])(?:\s|$|首|号)/);
+  const englishMatch = normalized.match(/\b(?:pick|play|choose)\s*(?:#|no\.?\s*)?([1-9])\b/i);
+
+  const token = chineseMatch?.[1] ?? englishMatch?.[1] ?? plainMatch?.[1];
+  if (!token) {
+    return null;
+  }
+
+  const chineseMap: Record<string, number> = {
+    一: 1,
+    二: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9
+  };
+  const parsed = chineseMap[token] ?? Number(token);
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > maxSize) {
+    return null;
+  }
+
+  const seemsSelectionIntent = /(播放|放|切到|选|选择|pick|play|choose|来一首|来首|第)/i.test(normalized);
+  if (!seemsSelectionIntent) {
+    return null;
+  }
+
+  return parsed - 1;
+}
+
+function toPlayableTrackQuery(track: Pick<TrackCandidate, "title" | "artist">) {
+  return `${track.title} - ${track.artist}`;
 }
 
 function trackTitleClassName(title: string) {
@@ -229,17 +328,17 @@ function isHotkeyBlockedTarget(target: EventTarget | null) {
 }
 
 const safePoeticCaptionPool = [
-  "The room keeps a little moonlight for whoever is still awake. 夜深的时候，灯光也会学着轻一点。",
-  "Some songs arrive like weather, some like memory. 有些旋律像天气，有些旋律像回忆。",
-  "We leave the static on the edges so the heart has somewhere to echo. 留一点噪点，让心事有地方回响。",
-  "Tonight the signal leans soft, like rain on a train window. 今夜的信号很轻，像雨落在车窗上。",
-  "Between one breath and the next, the station learns your silence. 一呼一吸之间，电台也在学你的沉默。",
-  "Neon fades, but the chorus keeps walking beside you. 霓虹会散，副歌还会陪你走一段路。"
+  "The room keeps a little moonlight for whoever is still awake.",
+  "Some songs arrive like weather, some like memory.",
+  "We leave static at the edges so the heart can echo.",
+  "Tonight the signal leans soft, like rain on a train window.",
+  "Between one breath and the next, the station learns your silence.",
+  "Neon fades, but the chorus keeps walking beside you."
 ];
 
 function buildTrackCaptionSafe(track: TrackCandidate) {
   const texture = track.tags.slice(0, 2).join(" / ") || track.mood;
-  return `${track.title} drifts in with a ${texture.toLowerCase()} glow. 这一首像夜色里慢慢亮起的一扇窗。`;
+  return `${track.title} drifts in with a ${texture.toLowerCase()} glow.`;
 }
 
 function buildWeatherCaptionSafe(summary: string) {
@@ -247,7 +346,7 @@ function buildWeatherCaptionSafe(summary: string) {
     return null;
   }
 
-  return `${summary} 风会先经过城市，再经过耳机。`;
+  return `${summary} The weather reaches the city before it reaches your headphones.`;
 }
 
 function buildRotatingCaptionsSafe(weatherSummary: string, track: TrackCandidate) {
@@ -593,6 +692,9 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
   const [companionHighlightIndex, setCompanionHighlightIndex] = useState(0);
   const [trackLyricLines, setTrackLyricLines] = useState<LyricLine[]>([]);
   const [lyricSource, setLyricSource] = useState<"lrc" | "text" | "none">("none");
+  const [trackDecisionExplanation, setTrackDecisionExplanation] = useState<TrackDecisionExplanation | null>(null);
+  const [isRejectedReasonsOpen, setIsRejectedReasonsOpen] = useState(false);
+  const [recommendedTracks, setRecommendedTracks] = useState<TrackCandidate[]>([]);
   const audioRef = useRef<HTMLAudioElement>(null);
   const voiceAudioRef = useRef<HTMLAudioElement>(null);
   const keyboardZoneRef = useRef<HTMLDivElement>(null);
@@ -620,6 +722,7 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
   const trackActivationRef = useRef<TrackActivationIntent | null>(null);
   const trackActivationTokenRef = useRef(0);
   const endedTrackIdRef = useRef<string | null>(null);
+  const audioErrorTrackIdRef = useRef<string | null>(null);
   const lyricsAbortRef = useRef<AbortController | null>(null);
   const trackSwitchAbortRef = useRef<AbortController | null>(null);
   const commentaryAbortRef = useRef<AbortController | null>(null);
@@ -630,7 +733,7 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
   const progressPercent = clamp((shownElapsedSeconds / displayedDurationSeconds) * 100, 0, 100);
   const volumePercent = clamp(volume * 100, 0, 100);
   const avatarLabel = (profile.artists[0]?.slice(0, 2) ?? "ME").toUpperCase();
-  const isBusy = isPending || isGreetingPending;
+  const isBusy = isPending;
   const canUseTts = isSpeechOutputSupported || isServerTtsAvailable;
   const rotatingCaptions = useMemo(
     () => buildRotatingCaptionsSafe(weatherSummary, radioState.nowPlaying),
@@ -641,6 +744,10 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
     () => buildCompanionLines(radioState.nowPlaying, radioState, activeCaption),
     [activeCaption, radioState, radioState.nowPlaying]
   );
+  const activeTrackDecisionExplanation =
+    trackDecisionExplanation && trackDecisionExplanation.trackId === radioState.nowPlaying.id
+      ? trackDecisionExplanation
+      : null;
   const activeLyricIndex = useMemo(() => {
     if (trackLyricLines.length === 0) {
       return -1;
@@ -1131,6 +1238,7 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
     setActualDurationSeconds(fallbackDuration(radioState.nowPlaying));
     setElapsedSeconds(Math.round(savedProgress));
     setSeekValue(Math.round(savedProgress));
+    audioErrorTrackIdRef.current = null;
 
     audio.pause();
     audio.removeAttribute("src");
@@ -1182,6 +1290,7 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
         .play()
         .then(() => {
           if (isTrackActivationCurrent(radioState.nowPlaying.id, activationToken)) {
+            audioErrorTrackIdRef.current = null;
             setIsPlaying(true);
           }
         })
@@ -1250,6 +1359,20 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
       void nextTrack({ resumePlayback: true, message: "Next track." });
     };
 
+    const handleError = () => {
+      if (audioErrorTrackIdRef.current === radioState.nowPlaying.id) {
+        return;
+      }
+
+      audioErrorTrackIdRef.current = radioState.nowPlaying.id;
+      setIsPlaying(false);
+      setTerminalTurns((current) => [
+        ...current,
+        buildLocalSystemTurn(`Audio failed for ${radioState.nowPlaying.title}. Skipping to the next playable track.`)
+      ]);
+      void nextTrack({ resumePlayback: true, message: "Skip broken audio source." });
+    };
+
     syncDuration();
     syncElapsed();
 
@@ -1258,6 +1381,7 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
     audio.addEventListener("pause", persistElapsed);
     audio.addEventListener("seeked", persistElapsed);
     audio.addEventListener("ended", handleEnded);
+    audio.addEventListener("error", handleError);
 
     return () => {
       audio.removeEventListener("loadedmetadata", syncDuration);
@@ -1265,6 +1389,7 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
       audio.removeEventListener("pause", persistElapsed);
       audio.removeEventListener("seeked", persistElapsed);
       audio.removeEventListener("ended", handleEnded);
+      audio.removeEventListener("error", handleError);
     };
   }, [isSeeking, radioState.nowPlaying.id]);
 
@@ -1358,7 +1483,38 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
     setSpeakingTurnId(null);
   }
 
-  function applyRadioState(nextState: RadioState, syncTurns = true) {
+  function applyRadioState(
+    nextState: RadioState,
+    syncTurns = true,
+    decision?: {
+      why_selected?: WhySelectedEntry[];
+      why_rejected?: WhyRejectedEntry[];
+      selectionStatus?: "picked" | "candidate_required" | "fallback_demo";
+      candidateTracks?: TrackCandidate[];
+    }
+  ) {
+    const selectedReasons = decision?.why_selected?.slice(0, 3) ?? [];
+    const rejectedReasons = decision?.why_rejected?.slice(0, 3) ?? [];
+    const hasDecisionReasons = selectedReasons.length > 0 || rejectedReasons.length > 0;
+
+    if (hasDecisionReasons) {
+      setTrackDecisionExplanation({
+        trackId: nextState.nowPlaying.id,
+        why_selected: selectedReasons,
+        why_rejected: rejectedReasons
+      });
+      setIsRejectedReasonsOpen(false);
+    } else if (radioState.nowPlaying.id !== nextState.nowPlaying.id) {
+      setTrackDecisionExplanation(null);
+      setIsRejectedReasonsOpen(false);
+    }
+
+    if (decision?.selectionStatus === "candidate_required" && (decision.candidateTracks?.length ?? 0) > 0) {
+      setRecommendedTracks((decision.candidateTracks ?? []).slice(0, 5));
+    } else if (decision?.selectionStatus === "picked") {
+      setRecommendedTracks([]);
+    }
+
     setPlaybackHistory((current) => {
       if (radioState.nowPlaying.id === nextState.nowPlaying.id) {
         return current;
@@ -1385,13 +1541,22 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
     setIsGreetingPending(true);
 
     const sendGreetingRequest = async (payload: { reset: boolean; latitude?: number; longitude?: number }) => {
-      const response = await fetch("/api/chat/greeting", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(payload)
-      });
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 8000);
+      let response: Response;
+
+      try {
+        response = await fetch("/api/chat/greeting", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal
+        });
+      } finally {
+        window.clearTimeout(timeout);
+      }
 
       if (!response.ok) {
         throw new Error("Greeting request failed");
@@ -1423,6 +1588,20 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
     }
   }
 
+  function playRecommendedTrack(track: TrackCandidate, sourceMessage: string) {
+    setRecommendedTracks([]);
+    void triggerTrackSwitch(
+      {
+        type: "track_query",
+        query: toPlayableTrackQuery(track)
+      },
+      {
+        message: sourceMessage,
+        persistUserTurn: true
+      }
+    );
+  }
+
   async function submitMessage(sourceMessage?: string) {
     const trimmed = (sourceMessage ?? messageRef.current).trim();
     if (!trimmed || isBusy) {
@@ -1441,6 +1620,17 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
     messageRef.current = "";
     setMessage("");
 
+    if (recommendedTracks.length > 0) {
+      const recommendationIndex = parseRecommendationChoice(trimmed, recommendedTracks.length);
+      if (recommendationIndex !== null) {
+        const picked = recommendedTracks[recommendationIndex];
+        if (picked) {
+          playRecommendedTrack(picked, trimmed);
+          return;
+        }
+      }
+    }
+
     const controlIntent = parseControlIntent(trimmed);
     if (controlIntent.type !== "none") {
       void triggerTrackSwitch(controlIntent, {
@@ -1453,27 +1643,23 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
     setIsPending(true);
 
     try {
-      const response = await fetch("/api/chat", {
+      const payload = await requestJsonWithTimeout<ChatResponsePayload>("/api/chat", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
+        timeoutMs: 15000,
+        retries: 1,
         body: JSON.stringify({
           message: trimmed,
           latitude: coords?.latitude,
           longitude: coords?.longitude
         })
       });
-
-      if (!response.ok) {
-        throw new Error("Chat request failed");
-      }
-
-      const payload = (await response.json()) as ChatResponsePayload;
       if (payload.weatherSummary) {
         setWeatherSummary(payload.weatherSummary);
       }
-      applyRadioState(payload.radioState, true);
+      applyRadioState(payload.radioState, true, payload);
     } catch (error) {
       setTerminalTurns((current) => [
         ...current,
@@ -1557,29 +1743,25 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
     commentaryAbortRef.current = controller;
 
     try {
-      const response = await fetch("/api/radio/select/commentary", {
+      const payload = await requestJsonWithTimeout<RadioCommentaryPayload>("/api/radio/select/commentary", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
         signal: controller.signal,
+        timeoutMs: 12000,
+        retries: 0,
         body: JSON.stringify({
           ...toRadioSelectRequestBody(action, message),
           expectedTrackId,
           switchToken
         })
       });
-
-      if (!response.ok) {
-        throw new Error("Track commentary failed");
-      }
-
-      const payload = (await response.json()) as RadioCommentaryPayload;
       if (controller.signal.aborted || commentaryRequestIdRef.current !== requestId || payload.skipped) {
         return;
       }
 
-      applyRadioState(payload.radioState, true);
+      applyRadioState(payload.radioState, true, payload);
     } catch {
       if (controller.signal.aborted) {
         return;
@@ -1622,23 +1804,19 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
     stopCurrentSpeech();
 
     try {
-      const response = await fetch("/api/radio/select", {
+      const payload = await requestJsonWithTimeout<RadioSelectPayload>("/api/radio/select", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
         signal: controller.signal,
+        timeoutMs: 12000,
+        retries: 1,
         body: JSON.stringify({
           ...toRadioSelectRequestBody(action, options?.message),
           persistUserTurn: options?.persistUserTurn === true
         })
       });
-
-      if (!response.ok) {
-        throw new Error("Track rotate failed");
-      }
-
-      const payload = (await response.json()) as RadioSelectPayload;
       if (controller.signal.aborted || trackSwitchRequestIdRef.current !== trackSwitchRequestId) {
         return;
       }
@@ -1648,7 +1826,7 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
           resumePlayback: options?.resumePlayback
         });
       }
-      applyRadioState(payload.radioState, true);
+      applyRadioState(payload.radioState, true, payload);
 
       if (payload.selectionStatus === "picked" && payload.switchToken) {
         void requestTrackCommentary(
@@ -1703,6 +1881,8 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
       setIsTrackSwitching(false);
       setIsCommentaryPending(false);
       stopCurrentSpeech();
+      setTrackDecisionExplanation(null);
+      setIsRejectedReasonsOpen(false);
       primeTrackActivation(previous, {
         resumePlayback: options?.resumePlayback
       });
@@ -2081,6 +2261,47 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
                       ))}
                     </div>
 
+                    {activeTrackDecisionExplanation ? (
+                      <section className="mt-5 rounded-[16px] border border-[var(--line)] bg-[var(--surface-3)] px-3 py-3">
+                        <div className="mb-2 text-[10px] uppercase tracking-[0.18em] text-[var(--accent)]">Why this track</div>
+                        <div className="space-y-2">
+                          {activeTrackDecisionExplanation.why_selected.map((reason) => (
+                            <div className="rounded-[10px] border border-[var(--line)] bg-[var(--surface-2)] px-2.5 py-2" key={`${reason.label}-${reason.detail}`}>
+                              <div className="flex items-center justify-between gap-2 text-[11px] text-[var(--text-main)]">
+                                <span>{reason.label.replace(/_/g, " ")}</span>
+                                <span className="text-[var(--accent)]">+{reason.scoreDelta.toFixed(2)}</span>
+                              </div>
+                              <p className="mt-1 m-0 text-[12px] leading-5 text-[var(--text-muted)]">{reason.detail}</p>
+                            </div>
+                          ))}
+                        </div>
+                        {activeTrackDecisionExplanation.why_rejected.length > 0 ? (
+                          <div className="mt-3">
+                            <button
+                              className="text-[11px] uppercase tracking-[0.16em] text-[var(--text-soft)] transition-colors hover:text-[var(--text-main)]"
+                              onClick={() => setIsRejectedReasonsOpen((current) => !current)}
+                              type="button"
+                            >
+                              {isRejectedReasonsOpen ? "Hide alternatives" : "Show alternatives"}
+                            </button>
+                            {isRejectedReasonsOpen ? (
+                              <div className="mt-2 space-y-2">
+                                {activeTrackDecisionExplanation.why_rejected.map((reason) => (
+                                  <div className="rounded-[10px] border border-[var(--line)] bg-[rgba(0,0,0,0.18)] px-2.5 py-2" key={`${reason.trackId}-${reason.detail}`}>
+                                    <div className="flex items-center justify-between gap-2 text-[11px] text-[var(--text-main)]">
+                                      <span className="truncate">{reason.title} - {reason.artist}</span>
+                                      <span className="text-[#FCA5A5]">{reason.scoreDelta.toFixed(2)}</span>
+                                    </div>
+                                    <p className="mt-1 m-0 text-[12px] leading-5 text-[var(--text-muted)]">{reason.detail}</p>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </section>
+                    ) : null}
+
                     <div className="mt-5">
                       <div className="mb-2 flex items-center justify-between text-[11px] text-[#64748B]">
                         <span>{formatTrackTime(shownElapsedSeconds)}</span>
@@ -2145,22 +2366,22 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
                           <span>{lyricSource === "none" ? "Toxy notes" : "Lyrics live"}</span>
                           <span>{formatTrackTime(shownElapsedSeconds)}</span>
                         </div>
-                        <div className="space-y-2">
+                        <div className="min-h-[9.4rem] space-y-2">
                           {displayedReaderRows.map((row) => (
                             <div
-                              className={`grid grid-cols-[56px_minmax(0,1fr)] items-start gap-3 transition-all duration-300 ${
+                              className={`grid grid-cols-[56px_minmax(0,1fr)] items-start gap-3 ${
                                 row.active ? "text-[var(--text-main)]" : "text-[var(--text-muted)]"
                               }`}
                               key={row.key}
                             >
                               <span className={`text-[10px] tracking-[0.12em] ${row.active ? "text-[var(--accent)]" : "text-[#64748B]"}`}>
-                                {lyricSource === "none" ? "toxy" : "lyric"}• {formatTrackTime(row.time)}
+                                {lyricSource === "none" ? "toxy" : "lyric"}鈥?{formatTrackTime(row.time)}
                               </span>
                               <p
-                                className={`m-0 text-[12px] leading-6 md:text-[13px] ${
+                                className={`m-0 min-h-[2.15rem] rounded-[12px] px-2 py-1 text-[12px] leading-6 transition-colors md:text-[13px] ${
                                   row.active
-                                    ? "translate-x-0 rounded-[12px] bg-[var(--accent-soft)] px-2 py-1 shadow-[0_0_18px_rgba(0,255,170,0.08)]"
-                                    : "opacity-72"
+                                    ? "bg-[var(--accent-soft)] text-[var(--text-main)] shadow-[0_0_18px_rgba(0,255,170,0.08)]"
+                                    : "bg-transparent opacity-72"
                                 }`}
                               >
                                 {row.text}
@@ -2170,6 +2391,39 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
                         </div>
                       </div>
                     </div>
+
+                    {recommendedTracks.length > 0 ? (
+                      <div className="mt-4 rounded-[20px] border border-[rgba(255,255,255,0.08)] bg-[linear-gradient(145deg,rgba(13,17,28,0.95),rgba(23,28,46,0.85))] p-3 shadow-[0_12px_34px_rgba(0,0,0,0.35)]">
+                        <div className="mb-2 px-1 text-[10px] uppercase tracking-[0.2em] text-[var(--accent)]">
+                          Recommended Playlist
+                        </div>
+                        <div className="space-y-2">
+                          {recommendedTracks.slice(0, 5).map((track, index) => (
+                            <button
+                              className="group flex w-full items-center gap-3 rounded-[14px] border border-[rgba(255,255,255,0.06)] bg-[rgba(255,255,255,0.02)] px-2.5 py-2 text-left transition-colors hover:border-[rgba(0,255,170,0.3)] hover:bg-[rgba(0,255,170,0.05)]"
+                              key={`${track.id}-${index}`}
+                              onClick={() => playRecommendedTrack(track, `play ${toPlayableTrackQuery(track)}`)}
+                              type="button"
+                            >
+                              <Image
+                                alt={`${track.title} cover`}
+                                className="h-10 w-10 shrink-0 rounded-[9px] object-cover"
+                                height={40}
+                                src={track.coverUrl || radioState.nowPlaying.coverUrl}
+                                unoptimized
+                                width={40}
+                              />
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate text-[13px] font-medium text-[var(--text-main)]">
+                                  {index + 1}. {track.title}
+                                </div>
+                                <div className="truncate text-[11px] text-[#94A3B8]">{track.artist}</div>
+                              </div>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
 
                     <div className="mt-5 flex items-center gap-3">
                       <svg fill="none" height="16" viewBox="0 0 24 24" width="16">
@@ -2201,13 +2455,6 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
                   <div className="text-[10px] uppercase tracking-[0.24em] text-[#64748B]">LIVE TERMINAL</div>
 
                   <div className="flex items-center gap-3">
-                    <span className={`rounded-full border px-2 py-1 text-[10px] uppercase tracking-[0.18em] ${
-                      isKeyboardZoneActive
-                        ? "border-[var(--line-strong)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                        : "border-[var(--line)] bg-[var(--surface-3)] text-[var(--text-muted)]"
-                    }`}>
-                      {isKeyboardZoneActive ? "keys active" : "click to arm keys"}
-                    </span>
                     <span className={`text-[11px] uppercase tracking-[0.16em] ${llmConnected ? "text-[var(--accent)]" : "text-[var(--text-muted)]"}`}>
                       {llmConnected ? "live" : "local"}
                     </span>
@@ -2441,9 +2688,11 @@ export function ToxyRadio({ profile, radioState: initialState, dailyPlaylist, ll
                 </motion.aside>
               </>
             ) : null}
+
           </AnimatePresence>
         </motion.section>
       </div>
     </main>
   );
 }
+
